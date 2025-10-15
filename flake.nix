@@ -17,12 +17,6 @@
           rustc
           rustfmt
           cargo
-
-          # Codecrafters
-          codecrafters-cli
-
-          # Endpoint testing
-          oha
         ];
 
         shellHook = ''
