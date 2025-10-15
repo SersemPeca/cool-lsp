@@ -153,13 +153,12 @@ pub enum Tok {
     Whitespace,
 
     // Line comments: `--` to end of line/EOF
-    // #[regex(r"--[^\n]*", lex_line_comment)]
-    #[regex(r"--[^\n]*")]
+    #[regex(r"--[^\n]*", lex_line_comment)]
+    // #[regex(r"--[^\n]*")]
     LineComment,
 
     // Nested block comments: handled in callback; supports nesting
-    // #[regex(r"\(\*", lex_block_comment)]
-    #[regex(r"\(\*")]
+    #[regex(r"\(\*", lex_block_comment)]
     BlockComment,
 }
 
@@ -172,15 +171,15 @@ fn lex_ws(lex: &mut Lexer<Tok>) -> Option<()> {
     }
 }
 
-fn lex_line_comment(lex: &mut Lexer<Tok>) -> Result<(), logos::Skip> {
+fn lex_line_comment(lex: &mut Lexer<Tok>) -> Option<()> {
     if lex.extras.cfg.emit_trivia {
-        Ok(())
+        Some(())
     } else {
-        Err(logos::Skip)
+        None
     }
 }
 
-fn lex_block_comment(lex: &mut Lexer<Tok>) -> Result<(), logos::Skip> {
+fn lex_block_comment(lex: &mut Lexer<Tok>) -> Option<()> {
     // We’re at the '(' of "(*"
     let bytes = lex.source().as_bytes();
     let mut i = lex.span().start; // current position
@@ -201,9 +200,9 @@ fn lex_block_comment(lex: &mut Lexer<Tok>) -> Result<(), logos::Skip> {
                 i += 2;
                 lex.bump(i - lex.span().end);
                 return if lex.extras.cfg.emit_trivia {
-                    Ok(())
+                    Some(())
                 } else {
-                    Err(logos::Skip)
+                    None
                 };
             } else {
                 depth -= 1;
@@ -219,9 +218,9 @@ fn lex_block_comment(lex: &mut Lexer<Tok>) -> Result<(), logos::Skip> {
         start: lex.span().start,
     });
     if lex.extras.cfg.emit_trivia {
-        Ok(())
+        Some(())
     } else {
-        Err(logos::Skip)
+        None
     }
 }
 
