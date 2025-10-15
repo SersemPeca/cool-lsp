@@ -12,6 +12,12 @@ impl Default for LexConfig {
     }
 }
 
+impl LexConfig {
+    fn new(emit_trivia: bool) -> Self {
+        LexConfig { emit_trivia }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Token {
     pub kind: Tok,
@@ -44,7 +50,7 @@ pub enum Tok {
     Integer,
 
     // Strings handled by a custom callback to enforce COOL rules
-    #[regex(r#""#, lex_string)]
+    #[regex("\"", lex_string)]
     String,
 
     // Special identifiers
@@ -143,17 +149,18 @@ pub enum Tok {
 
     // Whitespace (space, tab, CR, LF, FF, VT). Skip unless emit_trivia=true
     #[regex(r"[ \t\r\n\f\v]+", lex_ws)]
+    // #[regex(r"[ \t\r\n\f\v]+")]
     Whitespace,
 
     // Line comments: `--` to end of line/EOF
-    #[regex(r"--[^\n]*", lex_line_comment)]
+    // #[regex(r"--[^\n]*", lex_line_comment)]
+    #[regex(r"--[^\n]*")]
     LineComment,
 
     // Nested block comments: handled in callback; supports nesting
-    #[regex(r"\(\*", lex_block_comment)]
+    // #[regex(r"\(\*", lex_block_comment)]
+    #[regex(r"\(\*")]
     BlockComment,
-
-    Error,
 }
 
 // Callbacks for tricky tokens
@@ -161,19 +168,19 @@ fn lex_ws(lex: &mut Lexer<Tok>) -> Option<()> {
     if lex.extras.cfg.emit_trivia {
         Some(())
     } else {
-        None
+        None // don’t emit a token
     }
 }
 
-fn lex_line_comment(lex: &mut Lexer<Tok>) -> Option<()> {
+fn lex_line_comment(lex: &mut Lexer<Tok>) -> Result<(), logos::Skip> {
     if lex.extras.cfg.emit_trivia {
-        Some(())
+        Ok(())
     } else {
-        None
+        Err(logos::Skip)
     }
 }
 
-fn lex_block_comment(lex: &mut Lexer<Tok>) -> Option<()> {
+fn lex_block_comment(lex: &mut Lexer<Tok>) -> Result<(), logos::Skip> {
     // We’re at the '(' of "(*"
     let bytes = lex.source().as_bytes();
     let mut i = lex.span().start; // current position
@@ -194,9 +201,9 @@ fn lex_block_comment(lex: &mut Lexer<Tok>) -> Option<()> {
                 i += 2;
                 lex.bump(i - lex.span().end);
                 return if lex.extras.cfg.emit_trivia {
-                    Some(())
+                    Ok(())
                 } else {
-                    None
+                    Err(logos::Skip)
                 };
             } else {
                 depth -= 1;
@@ -212,13 +219,13 @@ fn lex_block_comment(lex: &mut Lexer<Tok>) -> Option<()> {
         start: lex.span().start,
     });
     if lex.extras.cfg.emit_trivia {
-        Some(())
+        Ok(())
     } else {
-        None
+        Err(logos::Skip)
     }
 }
 
-fn lex_string(lex: &mut Lexer<Tok>) -> Option<()> {
+fn lex_string(lex: &mut Lexer<Tok>) {
     // We’re at the opening quote
     let src = lex.source().as_bytes();
     let mut i = lex.span().start; // index of the opening quote
@@ -232,7 +239,7 @@ fn lex_string(lex: &mut Lexer<Tok>) -> Option<()> {
                 // closing quote
                 i += 1;
                 lex.bump(i - lex.span().end);
-                return Some(());
+                return;
             }
             b'\0' => {
                 lex.extras.diags.push(LexDiag::StringContainsNul { at: i });
@@ -245,7 +252,7 @@ fn lex_string(lex: &mut Lexer<Tok>) -> Option<()> {
                 // Stop at newline; COOL strings cannot span raw lines
                 // We don't advance to a closing quote; mark token to here
                 lex.bump(i - lex.span().end);
-                return Some(());
+                return;
             }
             b'\\' => {
                 // Escape sequence: consume backslash and the next char if any
@@ -256,7 +263,7 @@ fn lex_string(lex: &mut Lexer<Tok>) -> Option<()> {
                         start: lex.span().start,
                     });
                     lex.bump(i - lex.span().end);
-                    return Some(());
+                    return;
                 }
                 // allow \b \t \n \f \" \\ and also backslash + newline (line continuation)
                 // Even unknown escapes are allowed as literal per spec; we just consume one char
@@ -272,7 +279,7 @@ fn lex_string(lex: &mut Lexer<Tok>) -> Option<()> {
     });
     // bump to EOF
     lex.bump(i.saturating_sub(lex.span().end));
-    Some(())
+    ()
 }
 
 // Driver
@@ -284,10 +291,17 @@ pub fn lex(input: &str, cfg: LexConfig) -> (Vec<Token>, Vec<LexDiag>) {
     lexer.extras.cfg = cfg;
 
     let mut tokens = Vec::new();
-    while let Some(kind) = lexer.next() {
+    while let Some(res) = lexer.next() {
         let span = lexer.span();
+
+        let Ok(kind) = res else {
+            continue; // skip errors (including intentionally skipped tokens)
+        };
+
+        println!("Pushing TokenKind: {:?}", kind);
+
         tokens.push(Token {
-            kind: kind.unwrap(),
+            kind,
             range: span.start..span.end,
         });
     }
@@ -314,11 +328,11 @@ mod tests {
 
     #[test]
     fn booleans_case_rule() {
-        let (toks, _) = lex("true FALSE False fAlSe tRuE", LexConfig::default());
+        let (toks, _) = lex("true FALSE False fAlSe tRuE", LexConfig::new(false));
         // first token is TrueConst; tokens starting with uppercase F should be identifiers.
         assert!(matches!(toks[0].kind, Tok::TrueConst));
         assert!(matches!(toks[1].kind, Tok::TypeId | Tok::ObjectId)); // not a boolean
-        assert!(matches!(toks[2].kind, Tok::FalseConst));
+        assert!(matches!(toks[2].kind, Tok::TypeId | Tok::ObjectId));
         assert!(matches!(toks[3].kind, Tok::FalseConst));
         assert!(matches!(toks[4].kind, Tok::TrueConst));
     }
@@ -329,12 +343,16 @@ mod tests {
         assert!(d.is_empty());
 
         let (_t, d2) = lex("\"bad\nstring\"", LexConfig::default());
+
+        println!("LexDiags: d2: {:?}", d2);
+        println!("LexTokens: d2: {:?}", _t);
         assert!(
             d2.iter()
                 .any(|e| matches!(e, LexDiag::NewlineInString { .. }))
         );
 
         let (_t, d3) = lex("\"unfinished", LexConfig::default());
+        println!("TOKENS d3: {:?}", _t);
         assert!(
             d3.iter()
                 .any(|e| matches!(e, LexDiag::UnterminatedString { .. }))
