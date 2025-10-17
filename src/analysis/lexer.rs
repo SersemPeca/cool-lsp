@@ -69,6 +69,78 @@ pub enum Token {
     Error(String),
 }
 
+macro_rules! make_kw_lexer {
+    ($fn_name:ident, $kw:literal, $Variant:ident) => {
+        pub fn $fn_name<'src>()
+        -> impl Parser<'src, &'src str, Token, extra::Err<Simple<'src, char>>> {
+            just($kw)
+                .map(|_| Token::$Variant)
+                .labelled(concat!($kw, " keyword"))
+        }
+    };
+}
+
+macro_rules! make_kw_lexers {
+    ($( $fn_name:ident : $kw:literal => $Variant:ident ),+ $(,)?) => {
+        $( make_kw_lexer!($fn_name, $kw, $Variant); )+
+    };
+}
+
+make_kw_lexers! {
+    // Keywords
+    lex_class   : "class"    => Class,
+    lex_else    : "else"     => Else,
+    lex_fi      : "fi"       => Fi,
+    lex_if      : "if"       => If,
+    lex_in      : "in"       => In,
+    lex_inherits: "inherits" => Inherits,
+    lex_isvoid  : "isvoid"   => Isvoid,
+    lex_let     : "let"      => Let,
+    lex_loop    : "loop"     => Loop,
+    lex_pool    : "pool"     => Pool,
+    lex_then    : "then"     => Then,
+    lex_while   : "while"    => While,
+    lex_case    : "case"     => Case,
+    lex_esac    : "esac"     => Esac,
+    lex_new     : "new"      => New,
+    lex_of      : "of"       => Of,
+    lex_not     : "not"      => Not,
+
+    // Symbols / Punctuation
+    lex_lparen    : "("   => LParen,
+    lex_rparen    : ")"   => RParen,
+    lex_lbrace    : "{"   => LBrace,
+    lex_rbrace    : "}"   => RBrace,
+    lex_colon     : ":"   => Colon,
+    lex_semicolon : ";"   => Semicolon,
+    lex_comma     : ","   => Comma,
+    lex_dot       : "."   => Dot,
+    lex_at        : "@"   => At,
+
+    // Multi-char operators
+    lex_assign    : "<-"  => Assign,
+    lex_arrow     : "=>"  => Arrow,
+
+    // Arithmetic operators
+    lex_plus      : "+"   => Plus,
+    lex_minus     : "-"   => Minus,
+    lex_star      : "*"   => Star,
+    lex_slash     : "/"   => Slash,
+    lex_tilde     : "~"   => Tilde,
+
+    // Comparison operators
+    lex_lt        : "<"   => Lt,
+    lex_le        : "<="  => Le,
+    lex_eq        : "="   => Eq,
+}
+
+fn lex_class_keyword<'src>() -> impl Parser<'src, &'src str, Token, extra::Err<Simple<'src, char>>>
+{
+    just("Class")
+        .map(|_| Token::Class)
+        .labelled("class literal")
+}
+
 fn escape<'src>() -> impl Parser<'src, &'src str, char, extra::Err<Simple<'src, char>>> {
     just('\\').ignore_then(choice((
         just('t').to('\t'),
@@ -208,4 +280,10 @@ fn test_line_commend_ignored() {
             .into_result()
             .is_err(),
     );
+}
+
+#[test]
+fn test_keywords() {
+    assert_eq!(lex_class().parse("class").into_result(), Ok(Token::Class));
+    assert!(lex_class().parse("classy").into_result().is_err());
 }
