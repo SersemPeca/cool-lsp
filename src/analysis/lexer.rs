@@ -4,13 +4,18 @@ use chumsky::{
     IterParser, Parser,
     error::Simple,
     extra,
-    prelude::{choice, end, just, none_of, recursive},
+    prelude::{any, choice, end, just, none_of, recursive},
     text,
 };
 
 // Will be used later for diagnostics
 pub type Span = Range<usize>;
 pub type Spanned<T> = (T, Span);
+
+const KEYWORDS: &[&str] = &[
+    "class", "else", "fi", "if", "in", "inherits", "isvoid", "let", "loop", "pool", "then",
+    "while", "case", "esac", "new", "of", "not",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Token {
@@ -39,30 +44,30 @@ pub enum Token {
     TypeId(String),
     ObjectId(String),
 
-    LParen,    // (
-    RParen,    // )
-    LBrace,    // {
-    RBrace,    // }
-    Colon,     // :
-    Semicolon, // ;
-    Comma,     // ,
-    Dot,       // .
-    At,        // @
+    LParen,
+    RParen,
+    LBrace,
+    RBrace,
+    Colon,
+    Semicolon,
+    Comma,
+    Dot,
+    At,
 
     Assign, // <-
     Arrow,  // =>
 
-    Plus,  // +
-    Minus, // -
-    Star,  // *
-    Slash, // /
-    Tilde, // ~
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Tilde,
 
-    Lt, // <
-    Le, // <=
-    Eq, // =
+    Lt,
+    Le,
+    Eq,
 
-    LineComment(String),  // "-- ...\n"
+    LineComment(String),  // "-- ..."
     BlockComment(String), // "(* ... *( ... )* ... *)", optionally nested
 
     Eof,
@@ -134,11 +139,45 @@ make_kw_lexers! {
     lex_eq        : "="   => Eq,
 }
 
-fn lex_class_keyword<'src>() -> impl Parser<'src, &'src str, Token, extra::Err<Simple<'src, char>>>
+pub fn lex_type_id<'src>() -> impl Parser<'src, &'src str, Token, extra::Err<Simple<'src, char>>> {
+    let tail = any()
+        .filter(|c: &char| c.is_ascii_alphanumeric() || *c == '_')
+        .repeated()
+        .collect::<String>();
+
+    any()
+        .filter(char::is_ascii_uppercase)
+        .then(tail)
+        .map(|(head, rest)| {
+            let mut s = String::new();
+            s.push(head);
+            s.push_str(&rest);
+            Token::TypeId(s)
+        })
+}
+
+// ObjectId: Lowercase letter, then [A-Za-z0-9_]*
+pub fn lex_object_id<'src>() -> impl Parser<'src, &'src str, Token, extra::Err<Simple<'src, char>>>
 {
-    just("Class")
-        .map(|_| Token::Class)
-        .labelled("class literal")
+    let tail = any()
+        .filter(|c: &char| c.is_ascii_alphanumeric() || *c == '_')
+        .repeated()
+        .collect::<String>();
+
+    any()
+        .filter(char::is_ascii_lowercase)
+        .then(tail)
+        .map(|(head, rest)| {
+            let mut s = String::new();
+            s.push(head);
+            s.push_str(&rest);
+            Token::ObjectId(s)
+        })
+}
+
+// End-of-file token
+pub fn lex_eof<'src>() -> impl Parser<'src, &'src str, Token, extra::Err<Simple<'src, char>>> {
+    end().to(Token::Eof).labelled("end of file")
 }
 
 fn escape<'src>() -> impl Parser<'src, &'src str, char, extra::Err<Simple<'src, char>>> {
@@ -192,6 +231,80 @@ pub fn line_comment_ignored<'src>()
         .then_ignore(choice((text::newline().ignored(), end().ignored())))
         .ignored()
         .labelled("line comment")
+}
+
+pub fn lex<'src>() -> impl Parser<'src, &'src str, Vec<Token>, extra::Err<Simple<'src, char>>> {
+    // whitespace OR comments (ignored) — a function so we never need to clone a parser
+    fn ws_or_comment<'src>() -> impl Parser<'src, &'src str, (), extra::Err<Simple<'src, char>>> {
+        choice((
+            text::whitespace().ignored(),
+            line_comment_ignored(),
+            block_comment_ignored(),
+        ))
+        .repeated()
+        .ignored()
+    }
+
+    // Keywords (word-bounded). If you prefer your macro fns, replace this block with choice((lex_class(), ...))
+    let keywords = choice((
+        text::keyword("class").to(Token::Class),
+        text::keyword("else").to(Token::Else),
+        text::keyword("fi").to(Token::Fi),
+        text::keyword("if").to(Token::If),
+        text::keyword("in").to(Token::In),
+        text::keyword("inherits").to(Token::Inherits),
+        text::keyword("isvoid").to(Token::Isvoid),
+        text::keyword("let").to(Token::Let),
+        text::keyword("loop").to(Token::Loop),
+        text::keyword("pool").to(Token::Pool),
+        text::keyword("then").to(Token::Then),
+        text::keyword("while").to(Token::While),
+        text::keyword("case").to(Token::Case),
+        text::keyword("esac").to(Token::Esac),
+        text::keyword("new").to(Token::New),
+        text::keyword("of").to(Token::Of),
+        text::keyword("not").to(Token::Not),
+    ));
+
+    // Symbols / operators (longer first)
+    let symbols = choice((
+        // multi-char first
+        lex_le(),
+        lex_assign(),
+        lex_arrow(),
+        // singles
+        lex_lparen(),
+        lex_rparen(),
+        lex_lbrace(),
+        lex_rbrace(),
+        lex_colon(),
+        lex_semicolon(),
+        lex_comma(),
+        lex_dot(),
+        lex_at(),
+        lex_lt(),
+        lex_eq(),
+        lex_plus(),
+        lex_minus(),
+        lex_star(),
+        lex_slash(),
+        lex_tilde(),
+    ));
+
+    // One token (spanned)
+    let token = choice((
+        keywords,
+        lex_string(),
+        symbols,
+        lex_type_id(),
+        lex_object_id(),
+    ))
+    .labelled("token");
+
+    let comments = ws_or_comment().repeated();
+    let comments1 = ws_or_comment().repeated();
+
+    token.delimited_by(comments, comments1).repeated().collect()
 }
 
 #[test]
@@ -286,4 +399,37 @@ fn test_line_commend_ignored() {
 fn test_keywords() {
     assert_eq!(lex_class().parse("class").into_result(), Ok(Token::Class));
     assert!(lex_class().parse("classy").into_result().is_err());
+}
+
+#[test]
+fn test_object_id() {
+    assert_eq!(
+        lex_object_id().parse("test").into_result(),
+        Ok(Token::ObjectId(String::from("test")))
+    );
+
+    assert!(lex_object_id().parse("Test").into_result().is_err());
+}
+
+#[test]
+fn test_type_id() {
+    assert!(lex_type_id().parse("test").into_result().is_err());
+
+    assert_eq!(
+        lex_type_id().parse("Test").into_result(),
+        Ok(Token::TypeId(String::from("Test")))
+    );
+}
+
+#[test]
+fn test_lex() {
+    let test = r#"(*
+
+    *)
+    test"#;
+
+    assert_eq!(
+        lex().parse(test).into_result(),
+        Ok(vec![Token::ObjectId(String::from("test"))])
+    );
 }
