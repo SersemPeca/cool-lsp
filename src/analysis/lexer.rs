@@ -2,20 +2,17 @@ use std::ops::Range;
 
 use chumsky::{
     IterParser, Parser,
-    error::Simple,
+    error::{Rich, Simple},
     extra,
-    prelude::{any, choice, end, just, none_of, recursive},
+    label::LabelError,
+    prelude::{any, choice, end, just, none_of, recursive, skip_then_retry_until},
     text,
+    util::MaybeRef,
 };
 
 // Will be used later for diagnostics
 pub type Span = Range<usize>;
 pub type Spanned<T> = (T, Span);
-
-const KEYWORDS: &[&str] = &[
-    "class", "else", "fi", "if", "in", "inherits", "isvoid", "let", "loop", "pool", "then",
-    "while", "case", "esac", "new", "of", "not",
-];
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Token {
@@ -207,18 +204,27 @@ fn lex_string<'src>() -> impl Parser<'src, &'src str, Token, extra::Err<Simple<'
 pub fn block_comment_ignored<'src>()
 -> impl Parser<'src, &'src str, (), extra::Err<Simple<'src, char>>> {
     recursive(|comment| {
-        // A "chunk" is either another nested comment, or a single char that
-        // *cannot* close "*)" or start "(*"
+        // Match any character that isn’t a comment delimiter
+        let non_comment_char = any()
+            .filter(|&c| c != '(' && c != ')' && c != '*')
+            .ignored();
+
+        // A "chunk" is either:
+        //  - another nested comment,
+        //  - a safe char,
+        //  - '*' not followed by ')',
+        //  - '(' not followed by '*'.
         let chunk = choice((
             comment.ignored(),
-            none_of("*()").ignored(),
-            just('*').then_ignore(none_of(')')).ignored(), // '*' not followed by ')'
-            just('(').then_ignore(none_of('*')).ignored(), // '(' not followed by '*'
+            non_comment_char,
+            just('*').then_ignore(none_of(')')).ignored(),
+            just('(').then_ignore(none_of('*')).ignored(),
         ));
 
+        // Outer comment structure
         just("(*")
             .ignore_then(chunk.repeated())
-            .then_ignore(just("*)"))
+            .then_ignore(just("*)").or_not())
             .ignored()
     })
     .labelled("block comment")
@@ -233,19 +239,18 @@ pub fn line_comment_ignored<'src>()
         .labelled("line comment")
 }
 
-pub fn lex<'src>() -> impl Parser<'src, &'src str, Vec<Token>, extra::Err<Simple<'src, char>>> {
-    // whitespace OR comments (ignored) — a function so we never need to clone a parser
-    fn ws_or_comment<'src>() -> impl Parser<'src, &'src str, (), extra::Err<Simple<'src, char>>> {
-        choice((
-            text::whitespace().ignored(),
-            line_comment_ignored(),
-            block_comment_ignored(),
-        ))
-        .repeated()
-        .ignored()
-    }
+fn ws_or_comment<'src>() -> impl Parser<'src, &'src str, (), extra::Err<Simple<'src, char>>> {
+    choice((
+        text::whitespace().at_least(1).ignored(),
+        line_comment_ignored(),
+        block_comment_ignored(),
+    ))
+    .repeated()
+    .at_least(1)
+    .ignored()
+}
 
-    // Keywords (word-bounded). If you prefer your macro fns, replace this block with choice((lex_class(), ...))
+pub fn lex<'src>() -> impl Parser<'src, &'src str, Vec<Token>, extra::Err<Simple<'src, char>>> {
     let keywords = choice((
         text::keyword("class").to(Token::Class),
         text::keyword("else").to(Token::Else),
@@ -266,7 +271,6 @@ pub fn lex<'src>() -> impl Parser<'src, &'src str, Vec<Token>, extra::Err<Simple
         text::keyword("not").to(Token::Not),
     ));
 
-    // Symbols / operators (longer first)
     let symbols = choice((
         // multi-char first
         lex_le(),
@@ -301,10 +305,15 @@ pub fn lex<'src>() -> impl Parser<'src, &'src str, Vec<Token>, extra::Err<Simple
     ))
     .labelled("token");
 
-    let comments = ws_or_comment().repeated();
-    let comments1 = ws_or_comment().repeated();
+    let comments1 = ws_or_comment();
+    let comments2 = ws_or_comment();
 
-    token.delimited_by(comments, comments1).repeated().collect()
+    comments1
+        .ignore_then(token)
+        .then_ignore(comments2)
+        .repeated()
+        .collect()
+        .then_ignore(end())
 }
 
 #[test]
@@ -359,6 +368,24 @@ fn test_block_comment_ignored() {
     assert_eq!(
         block_comment_ignored().parse(test_str_3).into_result(),
         Ok(())
+    );
+
+    let test_str_4 = "(*  (* *)  )";
+
+    assert!(
+        block_comment_ignored()
+            .parse(test_str_4)
+            .into_result()
+            .is_err()
+    );
+
+    let test_str_5 = " (*  (* *)  *)";
+
+    assert!(
+        block_comment_ignored()
+            .parse(test_str_5)
+            .into_result()
+            .is_err()
     );
 }
 
@@ -422,14 +449,50 @@ fn test_type_id() {
 }
 
 #[test]
+fn lololo() {
+    let test_str_1 = "(*  (* *)  *)";
+
+    assert_eq!(ws_or_comment().parse(test_str_1).into_result(), Ok(()));
+
+    let test_str_2 = "   ";
+
+    assert_eq!(ws_or_comment().parse(test_str_2).into_result(), Ok(()));
+
+    let test_str_3 = "   (* *)";
+
+    assert_eq!(ws_or_comment().parse(test_str_3).into_result(), Ok(()));
+
+    let test_str_4 = "   (* *) -- TEST";
+
+    assert_eq!(ws_or_comment().parse(test_str_4).into_result(), Ok(()));
+
+    let test_str_5 = "   (* ";
+
+    assert!(ws_or_comment().parse(test_str_5).into_result().is_err());
+}
+
+#[test]
 fn test_lex() {
-    let test = r#"(*
+    let test_str_1 = r#"(*
 
     *)
     test"#;
 
     assert_eq!(
-        lex().parse(test).into_result(),
+        lex().parse(test_str_1).into_result(),
         Ok(vec![Token::ObjectId(String::from("test"))])
+    );
+
+    let test_str_2 = r#""hello"
+(* multi-line comments
+    (* need to be terminated even after nesting"#;
+
+    let x = lex().parse(test_str_2);
+
+    let errors = x.into_errors();
+
+    assert_eq!(
+        lex().parse(test_str_2).into_result(),
+        Ok((vec![Token::Str(String::from("hello"))]))
     );
 }
