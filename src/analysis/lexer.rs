@@ -1,19 +1,6 @@
-use std::ops::Range;
+const MAX_STRING_LENGTH: usize = 1024;
 
-use chumsky::{
-    IterParser, Parser,
-    error::{Rich, Simple},
-    extra,
-    label::LabelError,
-    prelude::{any, choice, end, just, none_of, recursive, skip_then_retry_until},
-    text,
-    util::MaybeRef,
-};
-
-// Will be used later for diagnostics
-pub type Span = Range<usize>;
-pub type Spanned<T> = (T, Span);
-
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Token {
     Class,
@@ -35,7 +22,7 @@ pub enum Token {
     Not,
 
     Bool(bool),
-    Int(i64),
+    Int(String),
     Str(String),
 
     TypeId(String),
@@ -64,435 +51,589 @@ pub enum Token {
     Le,
     Eq,
 
-    LineComment(String),  // "-- ..."
-    BlockComment(String), // "(* ... *( ... )* ... *)", optionally nested
-
     Eof,
-    Error(String),
 }
 
-macro_rules! make_kw_lexer {
-    ($fn_name:ident, $kw:literal, $Variant:ident) => {
-        pub fn $fn_name<'src>()
-        -> impl Parser<'src, &'src str, Token, extra::Err<Simple<'src, char>>> {
-            just($kw)
-                .map(|_| Token::$Variant)
-                .labelled(concat!($kw, " keyword"))
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LexToken {
+    pub token: Token,
+    pub line: usize,
+    pub column: usize,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LexError {
+    pub line: usize,
+    pub column: usize,
+    pub message: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LexResult {
+    pub tokens: Vec<LexToken>,
+    pub errors: Vec<LexError>,
+}
+
+#[allow(dead_code)]
+pub fn lex(input: &str) -> LexResult {
+    let mut lexer = Lexer::new(input);
+    lexer.scan();
+    LexResult {
+        tokens: lexer.tokens,
+        errors: lexer.errors,
+    }
+}
+
+#[allow(dead_code)]
+struct Lexer<'src> {
+    src: &'src str,
+    pos: usize,
+    line: usize,
+    column: usize,
+    tokens: Vec<LexToken>,
+    errors: Vec<LexError>,
+}
+
+impl<'src> Lexer<'src> {
+    fn new(src: &'src str) -> Self {
+        Self {
+            src,
+            pos: 0,
+            line: 1,
+            column: 1,
+            tokens: Vec::new(),
+            errors: Vec::new(),
         }
-    };
-}
+    }
 
-macro_rules! make_kw_lexers {
-    ($( $fn_name:ident : $kw:literal => $Variant:ident ),+ $(,)?) => {
-        $( make_kw_lexer!($fn_name, $kw, $Variant); )+
-    };
-}
+    fn scan(&mut self) {
+        while self.pos < self.src.len() {
+            if self.skip_whitespace_or_comment() {
+                continue;
+            }
 
-make_kw_lexers! {
-    // Keywords
-    lex_class   : "class"    => Class,
-    lex_else    : "else"     => Else,
-    lex_fi      : "fi"       => Fi,
-    lex_if      : "if"       => If,
-    lex_in      : "in"       => In,
-    lex_inherits: "inherits" => Inherits,
-    lex_isvoid  : "isvoid"   => Isvoid,
-    lex_let     : "let"      => Let,
-    lex_loop    : "loop"     => Loop,
-    lex_pool    : "pool"     => Pool,
-    lex_then    : "then"     => Then,
-    lex_while   : "while"    => While,
-    lex_case    : "case"     => Case,
-    lex_esac    : "esac"     => Esac,
-    lex_new     : "new"      => New,
-    lex_of      : "of"       => Of,
-    lex_not     : "not"      => Not,
+            let Some(ch) = self.peek() else {
+                break;
+            };
 
-    // Symbols / Punctuation
-    lex_lparen    : "("   => LParen,
-    lex_rparen    : ")"   => RParen,
-    lex_lbrace    : "{"   => LBrace,
-    lex_rbrace    : "}"   => RBrace,
-    lex_colon     : ":"   => Colon,
-    lex_semicolon : ";"   => Semicolon,
-    lex_comma     : ","   => Comma,
-    lex_dot       : "."   => Dot,
-    lex_at        : "@"   => At,
+            let line = self.line;
+            let column = self.column;
 
-    // Multi-char operators
-    lex_assign    : "<-"  => Assign,
-    lex_arrow     : "=>"  => Arrow,
+            match ch {
+                '"' => match self.lex_string() {
+                    Ok((token, token_line, token_column)) => {
+                        self.add_token(token_line, token_column, token);
+                    }
+                    Err(err) => {
+                        self.errors.push(err);
+                    }
+                },
+                c if c.is_ascii_digit() => {
+                    let token = self.lex_int();
+                    self.add_token(line, column, Token::Int(token));
+                }
+                c if c.is_ascii_alphabetic() => {
+                    let token = self.lex_identifier();
+                    self.add_token(line, column, token);
+                }
+                '_' => {
+                    let message = format!("Invalid symbol \"{}\"", display_invalid_char('_'));
+                    self.advance();
+                    self.errors.push(LexError {
+                        line,
+                        column,
+                        message,
+                    });
+                }
+                '(' => {
+                    if self.starts_with("(*") {
+                        // Comment handled by skip_whitespace_or_comment
+                        // but reaching here means nested comment inside token loop.
+                        // Consume and continue to next iteration.
+                        let _ = self.advance();
+                        let _ = self.advance();
+                        if let Err(err) = self.skip_block_comment() {
+                            self.errors.push(err);
+                            break;
+                        }
+                        continue;
+                    } else {
+                        self.advance();
+                        self.add_token(line, column, Token::LParen);
+                    }
+                }
+                ')' => {
+                    self.advance();
+                    self.add_token(line, column, Token::RParen);
+                }
+                '{' => {
+                    self.advance();
+                    self.add_token(line, column, Token::LBrace);
+                }
+                '}' => {
+                    self.advance();
+                    self.add_token(line, column, Token::RBrace);
+                }
+                ':' => {
+                    self.advance();
+                    self.add_token(line, column, Token::Colon);
+                }
+                ';' => {
+                    self.advance();
+                    self.add_token(line, column, Token::Semicolon);
+                }
+                ',' => {
+                    self.advance();
+                    self.add_token(line, column, Token::Comma);
+                }
+                '.' => {
+                    self.advance();
+                    self.add_token(line, column, Token::Dot);
+                }
+                '@' => {
+                    self.advance();
+                    self.add_token(line, column, Token::At);
+                }
+                '+' => {
+                    self.advance();
+                    self.add_token(line, column, Token::Plus);
+                }
+                '-' => {
+                    if self.starts_with("--") {
+                        self.advance();
+                        self.advance();
+                        self.skip_line_comment();
+                    } else {
+                        self.advance();
+                        self.add_token(line, column, Token::Minus);
+                    }
+                }
+                '*' => {
+                    if self.starts_with("*)") {
+                        self.advance();
+                        self.advance();
+                        self.errors.push(LexError {
+                            line,
+                            column,
+                            message: String::from("Unmatched *)"),
+                        });
+                    } else {
+                        self.advance();
+                        self.add_token(line, column, Token::Star);
+                    }
+                }
+                '/' => {
+                    self.advance();
+                    self.add_token(line, column, Token::Slash);
+                }
+                '~' => {
+                    self.advance();
+                    self.add_token(line, column, Token::Tilde);
+                }
+                '<' => {
+                    self.advance();
+                    match self.peek() {
+                        Some('-') => {
+                            self.advance();
+                            self.add_token(line, column, Token::Assign);
+                        }
+                        Some('=') => {
+                            self.advance();
+                            self.add_token(line, column, Token::Le);
+                        }
+                        _ => {
+                            self.add_token(line, column, Token::Lt);
+                        }
+                    }
+                }
+                '=' => {
+                    self.advance();
+                    if self.peek() == Some('>') {
+                        self.advance();
+                        self.add_token(line, column, Token::Arrow);
+                    } else {
+                        self.add_token(line, column, Token::Eq);
+                    }
+                }
+                '\0'..='\u{1F}' | '\u{7F}' => {
+                    let ch = self.advance().unwrap();
+                    let message = format!("Invalid symbol \"{}\"", display_invalid_char(ch));
+                    self.errors.push(LexError {
+                        line,
+                        column,
+                        message,
+                    });
+                }
+                _ => {
+                    let ch = self.advance().unwrap();
+                    let message = format!("Invalid symbol \"{}\"", display_invalid_char(ch));
+                    self.errors.push(LexError {
+                        line,
+                        column,
+                        message,
+                    });
+                }
+            }
+        }
+    }
 
-    // Arithmetic operators
-    lex_plus      : "+"   => Plus,
-    lex_minus     : "-"   => Minus,
-    lex_star      : "*"   => Star,
-    lex_slash     : "/"   => Slash,
-    lex_tilde     : "~"   => Tilde,
+    fn skip_whitespace_or_comment(&mut self) -> bool {
+        let mut skipped = false;
+        loop {
+            let Some(ch) = self.peek() else {
+                break;
+            };
 
-    // Comparison operators
-    lex_lt        : "<"   => Lt,
-    lex_le        : "<="  => Le,
-    lex_eq        : "="   => Eq,
-}
+            if ch.is_whitespace() {
+                skipped = true;
+                self.advance();
+                continue;
+            }
 
-pub fn lex_type_id<'src>() -> impl Parser<'src, &'src str, Token, extra::Err<Simple<'src, char>>> {
-    let tail = any()
-        .filter(|c: &char| c.is_ascii_alphanumeric() || *c == '_')
-        .repeated()
-        .collect::<String>();
+            if self.starts_with("--") {
+                skipped = true;
+                self.advance();
+                self.advance();
+                self.skip_line_comment();
+                continue;
+            }
 
-    any()
-        .filter(char::is_ascii_uppercase)
-        .then(tail)
-        .map(|(head, rest)| {
-            let mut s = String::new();
-            s.push(head);
-            s.push_str(&rest);
-            Token::TypeId(s)
+            if self.starts_with("(*") {
+                skipped = true;
+                self.advance();
+                self.advance();
+                if let Err(err) = self.skip_block_comment() {
+                    self.errors.push(err);
+                    self.pos = self.src.len();
+                    break;
+                }
+                continue;
+            }
+
+            break;
+        }
+
+        skipped
+    }
+
+    fn skip_line_comment(&mut self) {
+        while let Some(ch) = self.peek() {
+            if ch == '\n' {
+                break;
+            }
+            self.advance();
+        }
+    }
+
+    fn skip_block_comment(&mut self) -> Result<(), LexError> {
+        let mut depth = 1usize;
+
+        while let Some(ch) = self.peek() {
+            if self.starts_with("(*") {
+                self.advance();
+                self.advance();
+                depth += 1;
+                continue;
+            }
+
+            if self.starts_with("*)") {
+                self.advance();
+                self.advance();
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(());
+                }
+                continue;
+            }
+
+            self.advance();
+            match ch {
+                '\n' => continue,
+                _ => {}
+            }
+        }
+
+        let (line, column) = if self.column == 1 && self.line > 1 {
+            (self.line - 1, self.column)
+        } else {
+            (self.line, self.column)
+        };
+
+        Err(LexError {
+            line,
+            column,
+            message: String::from("Unmatched (*"),
         })
+    }
+
+    fn lex_int(&mut self) -> String {
+        let start = self.pos;
+        while let Some(ch) = self.peek() {
+            if ch.is_ascii_digit() {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.src[start..self.pos].to_string()
+    }
+
+    fn lex_identifier(&mut self) -> Token {
+        let start = self.pos;
+        let first_char = self.advance().unwrap();
+
+        while let Some(ch) = self.peek() {
+            if is_identifier_continue(ch) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        let lexeme = &self.src[start..self.pos];
+        let lower = lexeme.to_ascii_lowercase();
+
+        if let Some(token) = keyword_token(&lower) {
+            return token;
+        }
+
+        if is_bool_literal(first_char, &lower) {
+            return Token::Bool(lower == "true");
+        }
+
+        if first_char.is_ascii_uppercase() {
+            Token::TypeId(lexeme.to_string())
+        } else {
+            Token::ObjectId(lexeme.to_string())
+        }
+    }
+
+    fn lex_string(&mut self) -> Result<(Token, usize, usize), LexError> {
+        self.advance(); // consume opening quote
+        let mut buffer = String::new();
+        let mut length = 0usize;
+
+        loop {
+            let Some(ch) = self.peek() else {
+                return Err(LexError {
+                    line: self.line,
+                    column: self.column,
+                    message: String::from("Unterminated string at EOF"),
+                });
+            };
+
+            match ch {
+                '"' => {
+                    self.advance();
+                    let line = self.line;
+                    let column = if self.column > 1 { self.column - 1 } else { 1 };
+                    if self.pos >= self.src.len() {
+                        return Err(LexError {
+                            line,
+                            column,
+                            message: String::from("Unterminated string at EOF"),
+                        });
+                    }
+                    return Ok((Token::Str(buffer), line, column));
+                }
+                '\0' => {
+                    let line = self.line;
+                    let column = self.column;
+                    self.advance();
+                    self.skip_until_string_terminator();
+                    return Err(LexError {
+                        line,
+                        column,
+                        message: String::from("String contains null character"),
+                    });
+                }
+                '\n' => {
+                    let line = self.line;
+                    let column = self.column;
+                    self.advance();
+                    let message = if self.pos >= self.src.len() {
+                        "Unterminated string at EOF"
+                    } else {
+                        "String contains unescaped new line"
+                    };
+                    return Err(LexError {
+                        line,
+                        column,
+                        message: String::from(message),
+                    });
+                }
+                '\\' => {
+                    self.advance();
+                    let Some(escaped) = self.peek() else {
+                        return Err(LexError {
+                            line: self.line,
+                            column: self.column,
+                            message: String::from("Unterminated string at EOF"),
+                        });
+                    };
+
+                    match escaped {
+                        'b' => {
+                            self.advance();
+                            buffer.push('\u{0008}');
+                            length += 1;
+                        }
+                        't' => {
+                            self.advance();
+                            buffer.push('\t');
+                            length += 1;
+                        }
+                        'n' => {
+                            self.advance();
+                            buffer.push('\n');
+                            length += 1;
+                        }
+                        '\\' => {
+                            self.advance();
+                            buffer.push('\\');
+                            length += 1;
+                        }
+                        '"' => {
+                            self.advance();
+                            buffer.push('"');
+                            length += 1;
+                        }
+                        '\0' => {
+                            let line = self.line;
+                            let column = self.column;
+                            self.advance();
+                            self.skip_until_string_terminator();
+                            return Err(LexError {
+                                line,
+                                column,
+                                message: String::from("String contains escaped null character"),
+                            });
+                        }
+                        '\n' => {
+                            self.advance();
+                            buffer.push('\n');
+                            length += 1;
+                        }
+                        other => {
+                            self.advance();
+                            buffer.push(other);
+                            length += 1;
+                        }
+                    }
+                }
+                other => {
+                    self.advance();
+                    buffer.push(other);
+                    length += 1;
+                }
+            }
+
+            if length > MAX_STRING_LENGTH {
+                let line = self.line;
+                let column = if self.column > 0 { self.column } else { 1 };
+                self.skip_until_string_terminator();
+                return Err(LexError {
+                    line,
+                    column,
+                    message: String::from("String constant too long"),
+                });
+            }
+        }
+    }
+
+    fn skip_until_string_terminator(&mut self) {
+        while let Some(ch) = self.peek() {
+            self.advance();
+            match ch {
+                '"' => break,
+                '\\' => {
+                    if let Some(next) = self.peek() {
+                        if next == '\n' {
+                            self.advance();
+                        } else {
+                            self.advance();
+                        }
+                    }
+                }
+                '\n' => break,
+                _ => {}
+            }
+        }
+    }
+
+    fn add_token(&mut self, line: usize, column: usize, token: Token) {
+        self.tokens.push(LexToken {
+            token,
+            line,
+            column,
+        });
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.src[self.pos..].chars().next()
+    }
+
+    fn starts_with(&self, pattern: &str) -> bool {
+        self.src[self.pos..].starts_with(pattern)
+    }
+
+    fn advance(&mut self) -> Option<char> {
+        let ch = self.peek()?;
+        let len = ch.len_utf8();
+        self.pos += len;
+        if ch == '\n' {
+            self.line += 1;
+            self.column = 1;
+        } else {
+            self.column += 1;
+        }
+        Some(ch)
+    }
 }
 
-// ObjectId: Lowercase letter, then [A-Za-z0-9_]*
-pub fn lex_object_id<'src>() -> impl Parser<'src, &'src str, Token, extra::Err<Simple<'src, char>>>
-{
-    let tail = any()
-        .filter(|c: &char| c.is_ascii_alphanumeric() || *c == '_')
-        .repeated()
-        .collect::<String>();
-
-    any()
-        .filter(char::is_ascii_lowercase)
-        .then(tail)
-        .map(|(head, rest)| {
-            let mut s = String::new();
-            s.push(head);
-            s.push_str(&rest);
-            Token::ObjectId(s)
-        })
+fn keyword_token(lower: &str) -> Option<Token> {
+    match lower {
+        "class" => Some(Token::Class),
+        "else" => Some(Token::Else),
+        "fi" => Some(Token::Fi),
+        "if" => Some(Token::If),
+        "in" => Some(Token::In),
+        "inherits" => Some(Token::Inherits),
+        "isvoid" => Some(Token::Isvoid),
+        "let" => Some(Token::Let),
+        "loop" => Some(Token::Loop),
+        "pool" => Some(Token::Pool),
+        "then" => Some(Token::Then),
+        "while" => Some(Token::While),
+        "case" => Some(Token::Case),
+        "esac" => Some(Token::Esac),
+        "new" => Some(Token::New),
+        "of" => Some(Token::Of),
+        "not" => Some(Token::Not),
+        _ => None,
+    }
 }
 
-// End-of-file token
-pub fn lex_eof<'src>() -> impl Parser<'src, &'src str, Token, extra::Err<Simple<'src, char>>> {
-    end().to(Token::Eof).labelled("end of file")
+fn is_bool_literal(first_char: char, lower: &str) -> bool {
+    match (first_char, lower) {
+        ('t', "true") => true,
+        ('f', "false") => true,
+        _ => false,
+    }
 }
 
-fn escape<'src>() -> impl Parser<'src, &'src str, char, extra::Err<Simple<'src, char>>> {
-    just('\\').ignore_then(choice((
-        just('t').to('\t'),
-        just('b').to('\u{0008}'),
-        just('n').to('\n'),
-        just('f').to('\u{000C}'),
-        none_of("tbnf"),
-    )))
+fn is_identifier_continue(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
 }
 
-fn lex_string<'src>() -> impl Parser<'src, &'src str, Token, extra::Err<Simple<'src, char>>> {
-    let escape = escape();
-
-    let normal_char = none_of("\\\"\n");
-
-    let ch = choice((escape, normal_char));
-
-    just('"')
-        .ignore_then(ch.repeated().collect::<String>())
-        .then_ignore(just('"'))
-        .map(|captured| Token::Str(captured))
-        .labelled("string literal")
-}
-
-pub fn block_comment_ignored<'src>()
--> impl Parser<'src, &'src str, (), extra::Err<Simple<'src, char>>> {
-    recursive(|comment| {
-        // Match any character that isn’t a comment delimiter
-        let non_comment_char = any()
-            .filter(|&c| c != '(' && c != ')' && c != '*')
-            .ignored();
-
-        // A "chunk" is either:
-        //  - another nested comment,
-        //  - a safe char,
-        //  - '*' not followed by ')',
-        //  - '(' not followed by '*'.
-        let chunk = choice((
-            comment.ignored(),
-            non_comment_char,
-            just('*').then_ignore(none_of(')')).ignored(),
-            just('(').then_ignore(none_of('*')).ignored(),
-        ));
-
-        // Outer comment structure
-        just("(*")
-            .ignore_then(chunk.repeated())
-            .then_ignore(just("*)").or_not())
-            .ignored()
-    })
-    .labelled("block comment")
-}
-
-pub fn line_comment_ignored<'src>()
--> impl Parser<'src, &'src str, (), extra::Err<Simple<'src, char>>> {
-    just("--")
-        .ignore_then(none_of('\n').repeated()) // everything until a '\n'
-        .then_ignore(choice((text::newline().ignored(), end().ignored())))
-        .ignored()
-        .labelled("line comment")
-}
-
-fn ws_or_comment<'src>() -> impl Parser<'src, &'src str, (), extra::Err<Simple<'src, char>>> {
-    choice((
-        text::whitespace().at_least(1).ignored(),
-        line_comment_ignored(),
-        block_comment_ignored(),
-    ))
-    .repeated()
-    .at_least(1)
-    .ignored()
-}
-
-pub fn lex<'src>() -> impl Parser<'src, &'src str, Vec<Token>, extra::Err<Simple<'src, char>>> {
-    let keywords = choice((
-        text::keyword("class").to(Token::Class),
-        text::keyword("else").to(Token::Else),
-        text::keyword("fi").to(Token::Fi),
-        text::keyword("if").to(Token::If),
-        text::keyword("in").to(Token::In),
-        text::keyword("inherits").to(Token::Inherits),
-        text::keyword("isvoid").to(Token::Isvoid),
-        text::keyword("let").to(Token::Let),
-        text::keyword("loop").to(Token::Loop),
-        text::keyword("pool").to(Token::Pool),
-        text::keyword("then").to(Token::Then),
-        text::keyword("while").to(Token::While),
-        text::keyword("case").to(Token::Case),
-        text::keyword("esac").to(Token::Esac),
-        text::keyword("new").to(Token::New),
-        text::keyword("of").to(Token::Of),
-        text::keyword("not").to(Token::Not),
-    ));
-
-    let symbols = choice((
-        // multi-char first
-        lex_le(),
-        lex_assign(),
-        lex_arrow(),
-        // singles
-        lex_lparen(),
-        lex_rparen(),
-        lex_lbrace(),
-        lex_rbrace(),
-        lex_colon(),
-        lex_semicolon(),
-        lex_comma(),
-        lex_dot(),
-        lex_at(),
-        lex_lt(),
-        lex_eq(),
-        lex_plus(),
-        lex_minus(),
-        lex_star(),
-        lex_slash(),
-        lex_tilde(),
-    ));
-
-    // One token (spanned)
-    let token = choice((
-        keywords,
-        lex_string(),
-        symbols,
-        lex_type_id(),
-        lex_object_id(),
-    ))
-    .labelled("token");
-
-    let comments1 = ws_or_comment();
-    let comments2 = ws_or_comment();
-
-    comments1
-        .ignore_then(token)
-        .then_ignore(comments2)
-        .repeated()
-        .collect()
-        .then_ignore(end())
-}
-
-#[test]
-fn test_escape() {
-    assert_eq!(escape().parse(r"\c").into_result(), Ok('c'));
-
-    assert_eq!(escape().parse(r"\b").into_result(), Ok('\u{0008}'));
-    assert_eq!(escape().parse(r"\t").into_result(), Ok('\t'));
-    assert_eq!(escape().parse(r"\n").into_result(), Ok('\n'));
-    assert_eq!(escape().parse(r"\f").into_result(), Ok('\u{000C}'));
-}
-
-#[test]
-fn test_string() {
-    assert_eq!(
-        lex_string().parse("\"TEST\"").into_result(),
-        Ok(Token::Str(String::from("TEST")))
-    );
-
-    let err = lex_string().parse("\"T\nEST\"").into_result();
-
-    assert!(err.is_err_and(|arr| !arr.is_empty()));
-
-    let ok = lex_string().parse("\"T\\nEST\"").into_result();
-
-    assert!(ok.is_ok_and(|x| x == Token::Str(String::from("T\nEST"))));
-
-    assert_eq!(
-        lex_string().parse("\"T\u{0045}ST\"").into_result(),
-        Ok(Token::Str(String::from("TEST")))
-    );
-}
-
-#[test]
-fn test_block_comment_ignored() {
-    let test_str_1 = "(*\n*)";
-
-    assert_eq!(
-        block_comment_ignored().parse(test_str_1).into_result(),
-        Ok(())
-    );
-
-    let test_str_2 = "(*\n(*\n*)\n*)";
-
-    assert_eq!(
-        block_comment_ignored().parse(test_str_2).into_result(),
-        Ok(())
-    );
-
-    let test_str_3 = "(*  (* *)  *)";
-
-    assert_eq!(
-        block_comment_ignored().parse(test_str_3).into_result(),
-        Ok(())
-    );
-
-    let test_str_4 = "(*  (* *)  )";
-
-    assert!(
-        block_comment_ignored()
-            .parse(test_str_4)
-            .into_result()
-            .is_err()
-    );
-
-    let test_str_5 = " (*  (* *)  *)";
-
-    assert!(
-        block_comment_ignored()
-            .parse(test_str_5)
-            .into_result()
-            .is_err()
-    );
-}
-
-#[test]
-fn test_line_commend_ignored() {
-    let test_str_1 = "-- TEST";
-
-    assert_eq!(
-        line_comment_ignored().parse(test_str_1).into_result(),
-        Ok(())
-    );
-
-    let test_str_2 = "-- -- TEST";
-
-    assert_eq!(
-        line_comment_ignored().parse(test_str_2).into_result(),
-        Ok(())
-    );
-
-    let test_str_3 = "-- TEST -- TEST";
-
-    assert_eq!(
-        line_comment_ignored().parse(test_str_3).into_result(),
-        Ok(())
-    );
-
-    let test_str_3 = "-";
-
-    assert!(
-        line_comment_ignored()
-            .parse(test_str_3)
-            .into_result()
-            .is_err(),
-    );
-}
-
-#[test]
-fn test_keywords() {
-    assert_eq!(lex_class().parse("class").into_result(), Ok(Token::Class));
-    assert!(lex_class().parse("classy").into_result().is_err());
-}
-
-#[test]
-fn test_object_id() {
-    assert_eq!(
-        lex_object_id().parse("test").into_result(),
-        Ok(Token::ObjectId(String::from("test")))
-    );
-
-    assert!(lex_object_id().parse("Test").into_result().is_err());
-}
-
-#[test]
-fn test_type_id() {
-    assert!(lex_type_id().parse("test").into_result().is_err());
-
-    assert_eq!(
-        lex_type_id().parse("Test").into_result(),
-        Ok(Token::TypeId(String::from("Test")))
-    );
-}
-
-#[test]
-fn lololo() {
-    let test_str_1 = "(*  (* *)  *)";
-
-    assert_eq!(ws_or_comment().parse(test_str_1).into_result(), Ok(()));
-
-    let test_str_2 = "   ";
-
-    assert_eq!(ws_or_comment().parse(test_str_2).into_result(), Ok(()));
-
-    let test_str_3 = "   (* *)";
-
-    assert_eq!(ws_or_comment().parse(test_str_3).into_result(), Ok(()));
-
-    let test_str_4 = "   (* *) -- TEST";
-
-    assert_eq!(ws_or_comment().parse(test_str_4).into_result(), Ok(()));
-
-    let test_str_5 = "   (* ";
-
-    assert!(ws_or_comment().parse(test_str_5).into_result().is_err());
-}
-
-#[test]
-fn test_lex() {
-    let test_str_1 = r#"(*
-
-    *)
-    test"#;
-
-    assert_eq!(
-        lex().parse(test_str_1).into_result(),
-        Ok(vec![Token::ObjectId(String::from("test"))])
-    );
-
-    let test_str_2 = r#""hello"
-(* multi-line comments
-    (* need to be terminated even after nesting"#;
-
-    let x = lex().parse(test_str_2);
-
-    let errors = x.into_errors();
-
-    assert_eq!(
-        lex().parse(test_str_2).into_result(),
-        Ok((vec![Token::Str(String::from("hello"))]))
-    );
+fn display_invalid_char(ch: char) -> String {
+    match ch {
+        '\0'..='\u{1F}' | '\u{7F}' => format!("<0x{:02X}>", ch as u32),
+        '\\' => String::from("\\\\"),
+        '"' => String::from("\\\""),
+        _ => ch.to_string(),
+    }
 }

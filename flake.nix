@@ -17,6 +17,9 @@
           rustc
           rustfmt
           cargo
+
+          # Testing
+          python3
         ];
 
         shellHook = ''
