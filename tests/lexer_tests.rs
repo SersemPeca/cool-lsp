@@ -1,58 +1,77 @@
-use chumsky::Parser;
-use cool_lsp::analysis::lexer::{lex, Token};
+use cool_lsp::analysis::lexer::{LexError, LexToken, Token, lex};
 use std::fs;
 use std::path::Path;
 
-fn token_strings(tokens: &[Token]) -> Vec<String> {
-    tokens
-        .iter()
-        .filter_map(|tok| match tok {
-            Token::TypeId(s) => Some(format!("TYPEID {s}")),
-            Token::ObjectId(s) => Some(format!("OBJECTID {s}")),
-            Token::Int(n) => Some(format!("INT_CONST {n}")),
-            Token::Str(s) => Some(format!("STR_CONST {:?}", s)),
-            Token::Bool(b) => Some(format!("BOOL_CONST {}", if *b { "true" } else { "false" })),
-            Token::Class => Some(String::from("CLASS")),
-            Token::Else => Some(String::from("ELSE")),
-            Token::Fi => Some(String::from("FI")),
-            Token::If => Some(String::from("IF")),
-            Token::In => Some(String::from("IN")),
-            Token::Inherits => Some(String::from("INHERITS")),
-            Token::Isvoid => Some(String::from("ISVOID")),
-            Token::Let => Some(String::from("LET")),
-            Token::Loop => Some(String::from("LOOP")),
-            Token::Pool => Some(String::from("POOL")),
-            Token::Then => Some(String::from("THEN")),
-            Token::While => Some(String::from("WHILE")),
-            Token::Case => Some(String::from("CASE")),
-            Token::Esac => Some(String::from("ESAC")),
-            Token::New => Some(String::from("NEW")),
-            Token::Of => Some(String::from("OF")),
-            Token::Not => Some(String::from("NOT")),
-            Token::LParen => Some(String::from("'('")),
-            Token::RParen => Some(String::from("')'")),
-            Token::LBrace => Some(String::from("'{'")),
-            Token::RBrace => Some(String::from("'}'")),
-            Token::Colon => Some(String::from("':'")),
-            Token::Semicolon => Some(String::from("';'")),
-            Token::Comma => Some(String::from("','")),
-            Token::Dot => Some(String::from("'.'")),
-            Token::At => Some(String::from("'@'")),
-            Token::Assign => Some(String::from("ASSIGN")),
-            Token::Arrow => Some(String::from("DARROW")),
-            Token::Plus => Some(String::from("'+'")),
-            Token::Minus => Some(String::from("'-'")),
-            Token::Star => Some(String::from("'*'")),
-            Token::Slash => Some(String::from("'/'")),
-            Token::Tilde => Some(String::from("'~'")),
-            Token::Lt => Some(String::from("'<'")),
-            Token::Le => Some(String::from("LE")),
-            Token::Eq => Some(String::from("'='")),
-            Token::Eof => Some(String::from("EOF")),
-            Token::Error(e) => Some(format!("ERROR: {e}")),
-            Token::LineComment(_) | Token::BlockComment(_) => None,
-        })
-        .collect()
+fn stringify_cool_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\u{0008}' => out.push_str("\\b"),
+            '\u{000C}' => out.push_str("<0x0c>"),
+            _ if ch.is_control() => out.push_str(&format!("<0x{:02x}>", ch as u32)),
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn format_token(tok: &LexToken) -> String {
+    let kind = match &tok.token {
+        Token::TypeId(s) => format!("TYPEID {s}"),
+        Token::ObjectId(s) => format!("OBJECTID {s}"),
+        Token::Int(s) => format!("INT_CONST {s}"),
+        Token::Str(s) => format!("STR_CONST {}", stringify_cool_string(s)),
+        Token::Bool(b) => format!("BOOL_CONST {}", if *b { "true" } else { "false" }),
+        Token::Class => "CLASS".to_string(),
+        Token::Else => "ELSE".to_string(),
+        Token::Fi => "FI".to_string(),
+        Token::If => "IF".to_string(),
+        Token::In => "IN".to_string(),
+        Token::Inherits => "INHERITS".to_string(),
+        Token::Isvoid => "ISVOID".to_string(),
+        Token::Let => "LET".to_string(),
+        Token::Loop => "LOOP".to_string(),
+        Token::Pool => "POOL".to_string(),
+        Token::Then => "THEN".to_string(),
+        Token::While => "WHILE".to_string(),
+        Token::Case => "CASE".to_string(),
+        Token::Esac => "ESAC".to_string(),
+        Token::New => "NEW".to_string(),
+        Token::Of => "OF".to_string(),
+        Token::Not => "NOT".to_string(),
+        Token::LParen => "'('".to_string(),
+        Token::RParen => "')'".to_string(),
+        Token::LBrace => "'{'".to_string(),
+        Token::RBrace => "'}'".to_string(),
+        Token::Colon => "':'".to_string(),
+        Token::Semicolon => "';'".to_string(),
+        Token::Comma => "','".to_string(),
+        Token::Dot => "'.'".to_string(),
+        Token::At => "'@'".to_string(),
+        Token::Assign => "ASSIGN".to_string(),
+        Token::Arrow => "DARROW".to_string(),
+        Token::Plus => "'+'".to_string(),
+        Token::Minus => "'-'".to_string(),
+        Token::Star => "'*'".to_string(),
+        Token::Slash => "'/'".to_string(),
+        Token::Tilde => "'~'".to_string(),
+        Token::Lt => "'<'".to_string(),
+        Token::Le => "LE".to_string(),
+        Token::Eq => "'='".to_string(),
+        Token::Eof => "EOF".to_string(),
+    };
+
+    format!("#{} {}", tok.line, kind)
+}
+
+fn format_error(err: &LexError) -> String {
+    format!("#{} ERROR: {}", err.line, err.message)
 }
 
 fn parse_expected_output(expected: &str) -> (Vec<String>, Vec<String>) {
@@ -65,15 +84,10 @@ fn parse_expected_output(expected: &str) -> (Vec<String>, Vec<String>) {
             continue;
         }
 
-        let rest = match trimmed.split_once(' ') {
-            Some((prefix, tail)) if prefix.starts_with('#') => tail.trim_start(),
-            _ => trimmed,
-        };
-
-        if rest.starts_with("ERROR") {
-            errors.push(rest.to_string());
+        if trimmed.contains("ERROR: ") {
+            errors.push(trimmed.to_string());
         } else {
-            tokens.push(rest.to_string());
+            tokens.push(trimmed.to_string());
         }
     }
 
@@ -108,40 +122,34 @@ fn lexer_directory_tests() {
 
         let (expected_tokens, expected_errors) = parse_expected_output(&expected_output);
 
-        let parse_result = lex().parse(&input).into_result();
+        let actual = lex(&input);
+        let actual_tokens: Vec<String> = actual.tokens.iter().map(format_token).collect();
+        let actual_errors: Vec<String> = actual.errors.iter().map(format_error).collect();
 
-        match parse_result {
-            Ok(tokens) => {
-                let actual_strings = token_strings(&tokens);
+        let mut test_failed = false;
 
-                if !expected_errors.is_empty() {
-                    failed = true;
-                    eprintln!(
-                        "❌ {test_name} expected lexing error(s) but succeeded.\nExpected errors:\n{}",
-                        expected_errors.join("\n")
-                    );
-                    continue;
-                }
+        if actual_tokens != expected_tokens {
+            test_failed = true;
+            eprintln!(
+                "❌ {test_name} tokens differ:\nExpected:\n{}\nGot:\n{}",
+                expected_tokens.join("\n"),
+                actual_tokens.join("\n")
+            );
+        }
 
-                if actual_strings != expected_tokens {
-                    failed = true;
-                    eprintln!(
-                        "❌ {test_name} tokens differ:\nExpected:\n{}\nGot:\n{}",
-                        expected_tokens.join("\n"),
-                        actual_strings.join("\n")
-                    );
-                } else {
-                    println!("✅ {test_name} passed");
-                }
-            }
-            Err(errs) => {
-                if expected_errors.is_empty() {
-                    failed = true;
-                    eprintln!("❌ {test_name}: unexpected lexing error(s):\n{:#?}", errs);
-                } else {
-                    println!("✅ {test_name} produced expected lexing error(s)");
-                }
-            }
+        if actual_errors != expected_errors {
+            test_failed = true;
+            eprintln!(
+                "❌ {test_name} errors differ:\nExpected:\n{}\nGot:\n{}",
+                expected_errors.join("\n"),
+                actual_errors.join("\n")
+            );
+        }
+
+        if test_failed {
+            failed = true;
+        } else {
+            println!("✅ {test_name} passed");
         }
     }
 
