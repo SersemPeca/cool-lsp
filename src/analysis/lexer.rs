@@ -2,13 +2,15 @@ use std::ops::Range;
 
 use chumsky::{
     IterParser, Parser,
-    error::{Rich, Simple},
+    error::Rich,
     extra,
-    label::LabelError,
-    prelude::{any, choice, end, just, none_of, recursive, skip_then_retry_until},
+    prelude::{any, choice, end, just, none_of, recursive},
+    span::SimpleSpan,
     text,
-    util::MaybeRef,
 };
+
+#[cfg(test)]
+use chumsky::error::RichReason;
 
 // Will be used later for diagnostics
 pub type Span = Range<usize>;
@@ -73,8 +75,8 @@ pub enum Token {
 
 macro_rules! make_kw_lexer {
     ($fn_name:ident, $kw:literal, $Variant:ident) => {
-        pub fn $fn_name<'src>()
-        -> impl Parser<'src, &'src str, Token, extra::Err<Simple<'src, char>>> {
+        pub fn $fn_name<'src>() -> impl Parser<'src, &'src str, Token, extra::Err<Rich<'src, char>>>
+        {
             just($kw)
                 .map(|_| Token::$Variant)
                 .labelled(concat!($kw, " keyword"))
@@ -136,7 +138,7 @@ make_kw_lexers! {
     lex_eq        : "="   => Eq,
 }
 
-pub fn lex_type_id<'src>() -> impl Parser<'src, &'src str, Token, extra::Err<Simple<'src, char>>> {
+pub fn lex_type_id<'src>() -> impl Parser<'src, &'src str, Token, extra::Err<Rich<'src, char>>> {
     let tail = any()
         .filter(|c: &char| c.is_ascii_alphanumeric() || *c == '_')
         .repeated()
@@ -154,8 +156,7 @@ pub fn lex_type_id<'src>() -> impl Parser<'src, &'src str, Token, extra::Err<Sim
 }
 
 // ObjectId: Lowercase letter, then [A-Za-z0-9_]*
-pub fn lex_object_id<'src>() -> impl Parser<'src, &'src str, Token, extra::Err<Simple<'src, char>>>
-{
+pub fn lex_object_id<'src>() -> impl Parser<'src, &'src str, Token, extra::Err<Rich<'src, char>>> {
     let tail = any()
         .filter(|c: &char| c.is_ascii_alphanumeric() || *c == '_')
         .repeated()
@@ -173,11 +174,11 @@ pub fn lex_object_id<'src>() -> impl Parser<'src, &'src str, Token, extra::Err<S
 }
 
 // End-of-file token
-pub fn lex_eof<'src>() -> impl Parser<'src, &'src str, Token, extra::Err<Simple<'src, char>>> {
+pub fn lex_eof<'src>() -> impl Parser<'src, &'src str, Token, extra::Err<Rich<'src, char>>> {
     end().to(Token::Eof).labelled("end of file")
 }
 
-fn escape<'src>() -> impl Parser<'src, &'src str, char, extra::Err<Simple<'src, char>>> {
+fn escape<'src>() -> impl Parser<'src, &'src str, char, extra::Err<Rich<'src, char>>> {
     just('\\').ignore_then(choice((
         just('t').to('\t'),
         just('b').to('\u{0008}'),
@@ -187,7 +188,7 @@ fn escape<'src>() -> impl Parser<'src, &'src str, char, extra::Err<Simple<'src, 
     )))
 }
 
-fn lex_string<'src>() -> impl Parser<'src, &'src str, Token, extra::Err<Simple<'src, char>>> {
+fn lex_string<'src>() -> impl Parser<'src, &'src str, Token, extra::Err<Rich<'src, char>>> {
     let escape = escape();
 
     let normal_char = none_of("\\\"\n");
@@ -202,7 +203,7 @@ fn lex_string<'src>() -> impl Parser<'src, &'src str, Token, extra::Err<Simple<'
 }
 
 pub fn block_comment_ignored<'src>()
--> impl Parser<'src, &'src str, (), extra::Err<Simple<'src, char>>> {
+-> impl Parser<'src, &'src str, (), extra::Err<Rich<'src, char>>> {
     recursive(|comment| {
         // Match any character that isn’t a comment delimiter
         let non_comment_char = any()
@@ -223,15 +224,26 @@ pub fn block_comment_ignored<'src>()
 
         // Outer comment structure
         just("(*")
-            .ignore_then(chunk.repeated())
-            .then_ignore(just("*)").or_not())
+            .ignore_then(
+                chunk
+                    .repeated()
+                    .ignored()
+                    .then(just("*)").ignored().or_not())
+                    .try_map(|(_, closing), span: SimpleSpan<usize>| match closing {
+                        Some(()) => Ok(()),
+                        None => {
+                            let end = span.end;
+                            Err(Rich::custom((end..end).into(), "Unclosed comment"))
+                        }
+                    }),
+            )
             .ignored()
     })
     .labelled("block comment")
 }
 
-pub fn line_comment_ignored<'src>()
--> impl Parser<'src, &'src str, (), extra::Err<Simple<'src, char>>> {
+pub fn line_comment_ignored<'src>() -> impl Parser<'src, &'src str, (), extra::Err<Rich<'src, char>>>
+{
     just("--")
         .ignore_then(none_of('\n').repeated()) // everything until a '\n'
         .then_ignore(choice((text::newline().ignored(), end().ignored())))
@@ -239,7 +251,7 @@ pub fn line_comment_ignored<'src>()
         .labelled("line comment")
 }
 
-fn ws_or_comment<'src>() -> impl Parser<'src, &'src str, (), extra::Err<Simple<'src, char>>> {
+fn ws_or_comment<'src>() -> impl Parser<'src, &'src str, (), extra::Err<Rich<'src, char>>> {
     choice((
         text::whitespace().at_least(1).ignored(),
         line_comment_ignored(),
@@ -250,7 +262,7 @@ fn ws_or_comment<'src>() -> impl Parser<'src, &'src str, (), extra::Err<Simple<'
     .ignored()
 }
 
-pub fn lex<'src>() -> impl Parser<'src, &'src str, Vec<Token>, extra::Err<Simple<'src, char>>> {
+pub fn lex<'src>() -> impl Parser<'src, &'src str, Vec<Token>, extra::Err<Rich<'src, char>>> {
     let keywords = choice((
         text::keyword("class").to(Token::Class),
         text::keyword("else").to(Token::Else),
@@ -277,7 +289,7 @@ pub fn lex<'src>() -> impl Parser<'src, &'src str, Vec<Token>, extra::Err<Simple
         lex_assign(),
         lex_arrow(),
         // singles
-        lex_lparen(),
+        lex_lparen().then_ignore(just('*').not()),
         lex_rparen(),
         lex_lbrace(),
         lex_rbrace(),
@@ -305,14 +317,14 @@ pub fn lex<'src>() -> impl Parser<'src, &'src str, Vec<Token>, extra::Err<Simple
     ))
     .labelled("token");
 
-    let comments1 = ws_or_comment();
-    let comments2 = ws_or_comment();
-
-    comments1
-        .ignore_then(token)
-        .then_ignore(comments2)
+    ws_or_comment()
         .repeated()
-        .collect()
+        .ignore_then(
+            token
+                .then_ignore(ws_or_comment().repeated())
+                .repeated()
+                .collect(),
+        )
         .then_ignore(end())
 }
 
@@ -372,12 +384,22 @@ fn test_block_comment_ignored() {
 
     let test_str_4 = "(*  (* *)  )";
 
-    assert!(
-        block_comment_ignored()
-            .parse(test_str_4)
-            .into_result()
-            .is_err()
-    );
+    let errors = block_comment_ignored()
+        .parse(test_str_4)
+        .into_result()
+        .unwrap_err();
+
+    let unclosed = errors
+        .iter()
+        .find(
+            |error| matches!(error.reason(), RichReason::Custom(msg) if msg == "Unclosed comment"),
+        )
+        .expect("expected unclosed comment error span");
+
+    let span = unclosed.span();
+
+    assert_eq!(span.start, span.end);
+    assert_eq!(span.start, test_str_4.len() - 1);
 
     let test_str_5 = " (*  (* *)  *)";
 
@@ -476,23 +498,30 @@ fn test_lex() {
     let test_str_1 = r#"(*
 
     *)
-    test"#;
+    test
+"#;
 
     assert_eq!(
         lex().parse(test_str_1).into_result(),
         Ok(vec![Token::ObjectId(String::from("test"))])
     );
 
-    let test_str_2 = r#""hello"
+    let test_str_2 = r#"
+"hello"
 (* multi-line comments
     (* need to be terminated even after nesting"#;
 
-    let x = lex().parse(test_str_2);
+    let result = lex().parse(test_str_2);
 
-    let errors = x.into_errors();
+    dbg!(result.clone());
 
-    assert_eq!(
-        lex().parse(test_str_2).into_result(),
-        Ok((vec![Token::Str(String::from("hello"))]))
-    );
+    let errors = result.into_errors();
+
+    dbg!(errors.clone());
+
+    assert!(errors.iter().any(
+        |error| matches!(error.reason(), RichReason::Custom(msg) if msg == "Unclosed comment")
+    ));
+
+    assert!(lex().parse(test_str_2).into_result().is_err());
 }
